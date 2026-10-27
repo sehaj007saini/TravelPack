@@ -1,0 +1,183 @@
+const express = require("express");
+const mongoose = require("mongoose");
+const dns = require("dns");
+const cors = require("cors");
+const dotenv = require("dotenv");
+const path = require("path");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
+const errorHandler = require("./middleware/errorHandler");
+const sanitizeMiddleware = require("./middleware/sanitize");
+
+// Load environment variables from repo root .env (so server can be started from /server)
+dotenv.config({ path: path.resolve(__dirname, "../.env") });
+dotenv.config({ path: path.resolve(__dirname, "./.env") });
+
+// Initialize express app
+const app = express();
+// When running behind a proxy (like Render), trust the proxy so express
+// and express-rate-limit can use the X-Forwarded-* headers correctly.
+app.set("trust proxy", 1);
+
+// Security Middleware
+app.use(helmet());
+
+// Rate limiter - 100 requests per 15 min per IP
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  message: { msg: "Too many requests from this IP, please try again later." },
+});
+app.use("/api/auth", limiter);
+
+// Stricter rate limiter for login and registration attempts
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: {
+    message: "Too many login attempts, please try again after 15 minutes",
+  },
+});
+app.post("/api/auth/login", authLimiter);
+app.post("/api/auth/register", authLimiter);
+
+// Core Middleware
+const allowedOrigins = [
+  "http://localhost:3005",
+  "http://localhost:3000",
+  "http://localhost:5000",
+  "http://localhost:5001",
+  "http://127.0.0.1:3005",
+  "http://127.0.0.1:5000",
+  "http://127.0.0.1:3000",
+];
+
+const frontendUrls = [];
+if (process.env.FRONTEND_URL) {
+  frontendUrls.push(
+    ...process.env.FRONTEND_URL.split(",")
+      .map((url) => url.trim())
+      .filter(Boolean),
+  );
+}
+if (process.env.FRONTEND_URLS) {
+  frontendUrls.push(
+    ...process.env.FRONTEND_URLS.split(",")
+      .map((url) => url.trim())
+      .filter(Boolean),
+  );
+}
+allowedOrigins.push(...frontendUrls);
+
+function isOriginAllowed(origin) {
+  if (!origin) return true;
+  return allowedOrigins.includes(origin);
+}
+
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (isOriginAllowed(origin)) {
+        return callback(null, true);
+      }
+      console.warn(`CORS blocked origin: ${origin}`);
+      callback(new Error("Not allowed by CORS"));
+    },
+    credentials: true,
+  }),
+);
+app.use(express.json());
+app.use(sanitizeMiddleware);
+
+// Import routes
+const authRoutes = require("./routes/auth");
+const tripRoutes = require("./routes/trips");
+const weatherRoutes = require("./routes/weather");
+const expenseRoutes = require("./routes/expenses");
+const translatorRoutes = require("./routes/translator");
+const bookingRoutes = require("./routes/booking");
+const destinationRoutes = require("./routes/destinations");
+const packingRoutes = require("./routes/packing");
+
+// Use routes
+app.use("/api/auth", authRoutes);
+app.use("/api/trips", tripRoutes);
+app.use("/api/weather", weatherRoutes);
+app.use("/api/expenses", expenseRoutes);
+app.use("/api/translator", translatorRoutes);
+app.use("/api/booking", bookingRoutes);
+app.use("/api/destinations", destinationRoutes);
+app.use("/api/packing", packingRoutes);
+
+// Base route
+app.get("/", (req, res) => {
+  res.send("Travel Planner API is running!");
+});
+
+// Global error handler (must be last)
+app.use(errorHandler);
+
+if (!process.env.MONGO_URI) {
+  console.error(
+    "MONGO_URI is missing — set it in server/.env before using auth.",
+  );
+}
+
+const MIN_JWT_SECRET_LENGTH = 32;
+const WEAK_JWT_SECRETS = new Set([
+  "secret",
+  "password",
+  "jwt_secret",
+  "your_super_secret_jwt_key_here",
+  "mysecret",
+  "changeme",
+  "123456",
+]);
+
+function validateJwtSecret() {
+  const secret = process.env.JWT_SECRET;
+
+  if (!secret) {
+    console.error("JWT_SECRET is missing. Generate one with:");
+    console.error(
+      "  node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\"",
+    );
+    process.exit(1);
+  }
+
+  if (secret.length < MIN_JWT_SECRET_LENGTH) {
+    console.error(
+      `JWT_SECRET is too short (${secret.length} chars). Minimum is ${MIN_JWT_SECRET_LENGTH}.`,
+    );
+    process.exit(1);
+  }
+
+  if (WEAK_JWT_SECRETS.has(secret.toLowerCase())) {
+    console.error("JWT_SECRET is a known weak value. Choose a random one.");
+    process.exit(1);
+  }
+}
+
+// Optional DNS override for environments where the OS DNS resolver blocks SRV lookups.
+const dnsServers = (process.env.MONGO_DNS_SERVERS || "8.8.8.8,1.1.1.1")
+  .split(",")
+  .map((server) => server.trim())
+  .filter(Boolean);
+
+if (dnsServers.length > 0) {
+  dns.setServers(dnsServers);
+  console.log("Using custom DNS servers:", dnsServers);
+}
+
+// Connect to MongoDB
+mongoose.set("sanitizeFilter", true);
+mongoose
+  .connect(process.env.MONGO_URI)
+  .then(() => console.log("Connected to MongoDB"))
+  .catch((err) => console.error("Could not connect to MongoDB", err));
+
+// Start server
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
